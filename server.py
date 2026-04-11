@@ -1,0 +1,852 @@
+"""
+ServiceNow MCP Server — Production Ready
+Automatiki / Eli — v2.0.0
+
+Tools covered:
+  Records    : get_record, list_records, create_record, update_record, delete_record
+  Incidents  : get_incident, list_incidents, create_incident, update_incident,
+               get_similar_incidents
+  Changes    : get_change, list_changes, create_change
+  Problems   : get_problem, list_problems
+  CMDB       : get_ci, list_cis, get_ci_relationships
+  Users      : get_user, list_users
+  Catalog    : list_catalog_items, submit_catalog_request
+  Utilities  : run_query, get_table_schema, health_check
+"""
+
+import logging
+import os
+import re
+from contextlib import asynccontextmanager
+from typing import Any
+
+import httpx
+from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP
+
+load_dotenv()
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("servicenow-mcp")
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+def _require_env(key: str) -> str:
+    val = os.environ.get(key)
+    if not val:
+        raise RuntimeError(f"Required environment variable {key!r} is not set. Check your .env file.")
+    return val
+
+SN_BASE        = _require_env("SN_INSTANCE")
+SN_USER        = _require_env("SN_USER")
+SN_PASS        = _require_env("SN_PASS")
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")  # Required in production — set this
+PORT           = int(os.environ.get("MCP_PORT", "8000"))
+
+if not MCP_AUTH_TOKEN:
+    logger.warning("MCP_AUTH_TOKEN is not set — server is unauthenticated. Set this in production.")
+
+HEADERS = {
+    "Accept":       "application/json",
+    "Content-Type": "application/json",
+}
+
+# ─── Input validation ─────────────────────────────────────────────────────────
+
+_TABLE_RE  = re.compile(r"^[a-z][a-z0-9_]*$")
+_SYS_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+def _validate_table(name: str) -> str:
+    if not _TABLE_RE.match(name):
+        raise ValueError(f"Invalid table name: {name!r} — must be lowercase alphanumeric with underscores")
+    return name
+
+def _validate_sys_id(sys_id: str) -> str:
+    if not _SYS_ID_RE.match(sys_id):
+        raise ValueError(f"Invalid sys_id: {sys_id!r} — must be a 32-character lowercase hex string")
+    return sys_id
+
+# ─── Shared HTTP client (connection pooling via lifespan) ─────────────────────
+
+_client: httpx.AsyncClient | None = None
+
+@asynccontextmanager
+async def lifespan(app):
+    global _client
+    logger.info("Starting ServiceNow MCP server — instance: %s", SN_BASE)
+    _client = httpx.AsyncClient(
+        auth=(SN_USER, SN_PASS),
+        headers=HEADERS,
+        timeout=30.0,
+    )
+    yield
+    await _client.aclose()
+    logger.info("ServiceNow MCP server stopped")
+
+# ─── Server init ─────────────────────────────────────────────────────────────
+
+mcp = FastMCP("servicenow", lifespan=lifespan)
+
+# ─── ASGI Bearer-token auth middleware ────────────────────────────────────────
+
+class _BearerAuth:
+    """Pure-ASGI middleware — validates Authorization: Bearer <token> on every request."""
+
+    def __init__(self, app):
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if MCP_AUTH_TOKEN and scope["type"] in ("http", "websocket"):
+            headers = {k.lower(): v for k, v in scope.get("headers", [])}
+            auth_header = headers.get(b"authorization", b"").decode()
+            if auth_header != f"Bearer {MCP_AUTH_TOKEN}":
+                logger.warning(
+                    "Unauthorized request — invalid or missing Bearer token "
+                    "(client: %s)", scope.get("client")
+                )
+                if scope["type"] == "http":
+                    await send({
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [(b"content-type", b"text/plain; charset=utf-8")],
+                    })
+                    await send({
+                        "type": "http.response.body",
+                        "body": b"Unauthorized",
+                        "more_body": False,
+                    })
+                return
+        await self._app(scope, receive, send)
+
+# ─── HTTP helpers ─────────────────────────────────────────────────────────────
+
+async def _get(path: str, params: dict | None = None) -> dict | None:
+    logger.info("GET %s params=%s", path, params)
+    try:
+        r = await _client.get(f"{SN_BASE}{path}", params=params)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        logger.error("HTTP %s on GET %s: %s", e.response.status_code, path, e.response.text[:300])
+        return {"error": f"HTTP {e.response.status_code}: {e.response.text}"}
+    except Exception as e:
+        logger.error("Error on GET %s: %s", path, e)
+        return {"error": str(e)}
+
+async def _post(path: str, body: dict) -> dict | None:
+    logger.info("POST %s", path)
+    try:
+        r = await _client.post(f"{SN_BASE}{path}", json=body)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        logger.error("HTTP %s on POST %s: %s", e.response.status_code, path, e.response.text[:300])
+        return {"error": f"HTTP {e.response.status_code}: {e.response.text}"}
+    except Exception as e:
+        logger.error("Error on POST %s: %s", path, e)
+        return {"error": str(e)}
+
+async def _patch(path: str, body: dict) -> dict | None:
+    logger.info("PATCH %s", path)
+    try:
+        r = await _client.patch(f"{SN_BASE}{path}", json=body)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        logger.error("HTTP %s on PATCH %s: %s", e.response.status_code, path, e.response.text[:300])
+        return {"error": f"HTTP {e.response.status_code}: {e.response.text}"}
+    except Exception as e:
+        logger.error("Error on PATCH %s: %s", path, e)
+        return {"error": str(e)}
+
+async def _delete(path: str) -> dict:
+    logger.info("DELETE %s", path)
+    try:
+        r = await _client.delete(f"{SN_BASE}{path}")
+        r.raise_for_status()
+        return {"success": True, "status": r.status_code}
+    except httpx.HTTPStatusError as e:
+        logger.error("HTTP %s on DELETE %s: %s", e.response.status_code, path, e.response.text[:300])
+        return {"error": f"HTTP {e.response.status_code}: {e.response.text}"}
+    except Exception as e:
+        logger.error("Error on DELETE %s: %s", path, e)
+        return {"error": str(e)}
+
+def _table(table: str) -> str:
+    return f"/api/now/table/{table}"
+
+# ─── Utility ──────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def health_check() -> dict:
+    """
+    Verify the MCP server is running and can reach the ServiceNow instance.
+    Call this first to confirm connectivity before running other tools.
+    Returns instance URL, auth status, and a sample API response.
+    """
+    data = await _get("/api/now/table/sys_user", params={"sysparm_limit": 1})
+    if data and "error" not in data:
+        return {"status": "ok", "instance": SN_BASE, "auth": "valid"}
+    return {"status": "error", "instance": SN_BASE, "detail": data}
+
+
+@mcp.tool()
+async def get_table_schema(table_name: str) -> dict:
+    """
+    Get the field schema for any ServiceNow table.
+    Use this before create/update calls to discover available fields and their types.
+
+    Args:
+        table_name: ServiceNow table name (e.g. 'incident', 'change_request', 'cmdb_ci_server')
+    """
+    _validate_table(table_name)
+    data = await _get("/api/now/table/sys_dictionary", params={
+        "sysparm_query":  f"name={table_name}",
+        "sysparm_fields": "element,internal_type,mandatory,default_value,max_length",
+        "sysparm_limit":  100,
+    })
+    return data or {"error": "Could not fetch schema"}
+
+
+@mcp.tool()
+async def run_query(
+    table_name: str,
+    query: str,
+    fields: str = "",
+    limit: int = 10,
+    offset: int = 0,
+) -> dict:
+    """
+    Run an encoded query against any ServiceNow table using the Table API.
+    Useful for ad-hoc lookups and complex filtered searches.
+
+    Args:
+        table_name : ServiceNow table name (e.g. 'incident', 'change_request')
+        query      : Encoded query string (e.g. 'active=true^priority=1^assigned_to=javascript:gs.getUserID()')
+        fields     : Comma-separated field list. Leave blank for all fields.
+        limit      : Max records to return (default 10, max 100)
+        offset     : Pagination offset (default 0)
+    """
+    _validate_table(table_name)
+    params: dict[str, Any] = {
+        "sysparm_query":          query,
+        "sysparm_limit":          max(1, min(limit, 100)),
+        "sysparm_offset":         max(0, offset),
+        "sysparm_display_value":  "true",
+    }
+    if fields:
+        params["sysparm_fields"] = fields
+    return await _get(_table(table_name), params=params) or {"error": "Query failed"}
+
+
+# ─── Generic record CRUD ──────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_record(table_name: str, sys_id: str, fields: str = "") -> dict:
+    """
+    Get a single ServiceNow record by sys_id from any table.
+
+    Args:
+        table_name : Table name (e.g. 'incident', 'problem', 'change_request')
+        sys_id     : The record's sys_id (32-char hex GUID)
+        fields     : Optional comma-separated field list. Blank = all fields.
+    """
+    _validate_table(table_name)
+    _validate_sys_id(sys_id)
+    params: dict[str, Any] = {"sysparm_display_value": "true"}
+    if fields:
+        params["sysparm_fields"] = fields
+    return await _get(f"{_table(table_name)}/{sys_id}", params=params) or {"error": "Not found"}
+
+
+@mcp.tool()
+async def list_records(
+    table_name: str,
+    query: str = "",
+    fields: str = "",
+    limit: int = 10,
+    offset: int = 0,
+) -> dict:
+    """
+    List records from any ServiceNow table with optional filtering.
+
+    Args:
+        table_name : Table name (e.g. 'incident', 'sc_request')
+        query      : Encoded query (e.g. 'active=true^priority=1'). Blank = no filter.
+        fields     : Comma-separated fields. Blank = all fields.
+        limit      : Records to return (default 10, max 100)
+        offset     : Pagination offset
+    """
+    _validate_table(table_name)
+    params: dict[str, Any] = {
+        "sysparm_limit":          max(1, min(limit, 100)),
+        "sysparm_offset":         max(0, offset),
+        "sysparm_display_value":  "true",
+    }
+    if query:
+        params["sysparm_query"] = query
+    if fields:
+        params["sysparm_fields"] = fields
+    return await _get(_table(table_name), params=params) or {"error": "List failed"}
+
+
+@mcp.tool()
+async def create_record(table_name: str, fields: dict) -> dict:
+    """
+    Create a new record in any ServiceNow table.
+    Call get_table_schema first if unsure of required fields.
+
+    Args:
+        table_name : Table name (e.g. 'incident', 'change_request')
+        fields     : Dict of field_name -> value to set on the new record.
+                     Example: {"short_description": "VPN down", "priority": "1", "caller_id": "admin"}
+    """
+    _validate_table(table_name)
+    return await _post(_table(table_name), fields) or {"error": "Create failed"}
+
+
+@mcp.tool()
+async def update_record(table_name: str, sys_id: str, fields: dict) -> dict:
+    """
+    Update an existing ServiceNow record by sys_id.
+
+    Args:
+        table_name : Table name (e.g. 'incident')
+        sys_id     : The record's sys_id (32-char hex GUID)
+        fields     : Dict of field_name -> new value. Only include fields to change.
+                     Example: {"state": "2", "work_notes": "Investigating now"}
+    """
+    _validate_table(table_name)
+    _validate_sys_id(sys_id)
+    return await _patch(f"{_table(table_name)}/{sys_id}", fields) or {"error": "Update failed"}
+
+
+@mcp.tool()
+async def delete_record(table_name: str, sys_id: str, confirm: bool = False) -> dict:
+    """
+    Delete a ServiceNow record by sys_id. This is permanent and cannot be undone.
+    You MUST pass confirm=true to execute the deletion.
+
+    Args:
+        table_name : Table name
+        sys_id     : The record's sys_id (32-char hex GUID)
+        confirm    : Must be true to execute. Defaults to false as a safety guard.
+    """
+    if not confirm:
+        return {
+            "error": "Deletion not executed. Pass confirm=true to permanently delete this record."
+        }
+    _validate_table(table_name)
+    _validate_sys_id(sys_id)
+    return await _delete(f"{_table(table_name)}/{sys_id}")
+
+
+# ─── Incidents ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_incident(number: str) -> dict:
+    """
+    Get a single incident by incident number (e.g. INC0010001).
+    Returns full incident details including caller, assignment group, state, priority, and work notes.
+
+    Args:
+        number: Incident number (e.g. 'INC0010001')
+    """
+    data = await _get(_table("incident"), params={
+        "sysparm_query":         f"number={number}",
+        "sysparm_display_value": "true",
+        "sysparm_limit":         1,
+    })
+    records = (data or {}).get("result", [])
+    return records[0] if records else {"error": f"Incident {number} not found"}
+
+
+@mcp.tool()
+async def list_incidents(
+    query: str = "active=true",
+    fields: str = "number,short_description,state,priority,assigned_to,assignment_group,opened_at",
+    limit: int = 10,
+    offset: int = 0,
+) -> dict:
+    """
+    List incidents with filtering. Defaults to active incidents.
+    Common query patterns:
+      - All P1s open:            priority=1^active=true
+      - Assigned to me:          assigned_to=javascript:gs.getUserID()
+      - Unassigned in group:     assignment_group.name=Service Desk^assigned_to=NULL
+      - Opened today:            opened_atONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()
+
+    Args:
+        query  : Encoded query string (default: active=true)
+        fields : Comma-separated field names
+        limit  : Max records (default 10, max 100)
+        offset : Pagination offset
+    """
+    params: dict[str, Any] = {
+        "sysparm_query":         query,
+        "sysparm_fields":        fields,
+        "sysparm_limit":         max(1, min(limit, 100)),
+        "sysparm_offset":        max(0, offset),
+        "sysparm_display_value": "true",
+    }
+    return await _get(_table("incident"), params=params) or {"error": "Query failed"}
+
+
+@mcp.tool()
+async def create_incident(
+    short_description: str,
+    caller_id: str,
+    category: str = "inquiry",
+    subcategory: str = "",
+    priority: str = "3",
+    assignment_group: str = "",
+    description: str = "",
+    impact: str = "3",
+    urgency: str = "3",
+) -> dict:
+    """
+    Create a new ServiceNow incident.
+
+    Args:
+        short_description : One-line summary (required)
+        caller_id         : Username or sys_id of the affected user (required)
+        category          : Category (e.g. 'network', 'hardware', 'software', 'inquiry')
+        subcategory       : Subcategory value
+        priority          : 1=Critical, 2=High, 3=Moderate, 4=Low (default: 3)
+        assignment_group  : Group name or sys_id to assign to
+        description       : Full description / steps to reproduce
+        impact            : 1=High, 2=Medium, 3=Low (default: 3)
+        urgency           : 1=High, 2=Medium, 3=Low (default: 3)
+    """
+    body: dict[str, Any] = {
+        "short_description": short_description,
+        "caller_id":         caller_id,
+        "category":          category,
+        "priority":          priority,
+        "impact":            impact,
+        "urgency":           urgency,
+    }
+    if subcategory:       body["subcategory"]       = subcategory
+    if assignment_group:  body["assignment_group"]  = assignment_group
+    if description:       body["description"]       = description
+    return await _post(_table("incident"), body) or {"error": "Create failed"}
+
+
+@mcp.tool()
+async def update_incident(
+    number: str,
+    state: str = "",
+    work_notes: str = "",
+    close_notes: str = "",
+    close_code: str = "",
+    assigned_to: str = "",
+    assignment_group: str = "",
+    priority: str = "",
+    additional_fields: dict | None = None,
+) -> dict:
+    """
+    Update an existing incident by number (e.g. INC0010001).
+    Only provide fields you want to change.
+
+    State values: 1=New, 2=In Progress, 3=On Hold, 6=Resolved, 7=Closed
+    Close codes: Solved (Permanently), Solved (Work Around), Not Solved (Not Reproducible),
+                 Not Solved (Too Costly), Closed/Resolved by Caller
+
+    Args:
+        number           : Incident number (e.g. INC0010001)
+        state            : New state value
+        work_notes       : Internal work note to add
+        close_notes      : Resolution notes (required when resolving)
+        close_code       : Close code (required when resolving)
+        assigned_to      : Username or sys_id to assign to
+        assignment_group : Group name or sys_id
+        priority         : New priority (1-4)
+        additional_fields: Any other fields as a dict
+    """
+    data = await _get(_table("incident"), params={
+        "sysparm_query":  f"number={number}",
+        "sysparm_fields": "sys_id",
+        "sysparm_limit":  1,
+    })
+    records = (data or {}).get("result", [])
+    if not records:
+        return {"error": f"Incident {number} not found"}
+    sys_id = records[0]["sys_id"]
+
+    body: dict[str, Any] = {}
+    if state:             body["state"]            = state
+    if work_notes:        body["work_notes"]       = work_notes
+    if close_notes:       body["close_notes"]      = close_notes
+    if close_code:        body["close_code"]       = close_code
+    if assigned_to:       body["assigned_to"]      = assigned_to
+    if assignment_group:  body["assignment_group"] = assignment_group
+    if priority:          body["priority"]         = priority
+    if additional_fields:
+        body.update(additional_fields)
+
+    return await _patch(f"{_table('incident')}/{sys_id}", body) or {"error": "Update failed"}
+
+
+@mcp.tool()
+async def get_similar_incidents(
+    input_text: str,
+    limit: int = 5,
+    state_filter: str = "",
+) -> dict:
+    """
+    Find incidents with similar short descriptions to the input text.
+    Useful for duplicate detection and RCA. Searches each significant word.
+
+    Args:
+        input_text   : Text to search for (e.g. 'VPN not connecting after password change')
+        limit        : Max results per keyword match (default 5, max 20)
+        state_filter : Optional state filter (e.g. '6' for Resolved only)
+    """
+    stop_words = {"the", "a", "an", "is", "in", "on", "at", "to", "for",
+                  "of", "and", "or", "not", "with", "after", "before"}
+    keywords = [
+        w.strip().lower()
+        for w in input_text.split()
+        if w.strip().lower() not in stop_words and len(w.strip()) > 2
+    ]
+
+    all_results: list = []
+    seen: set = set()
+    capped_limit = max(1, min(limit, 20))
+
+    for keyword in keywords[:5]:
+        base_query = f"short_descriptionCONTAINS{keyword}"
+        if state_filter:
+            base_query += f"^state={state_filter}"
+        data = await _get(_table("incident"), params={
+            "sysparm_query":         base_query,
+            "sysparm_fields":        "number,short_description,state,priority,resolved_at,close_notes",
+            "sysparm_limit":         capped_limit,
+            "sysparm_display_value": "true",
+        })
+        for rec in (data or {}).get("result", []):
+            if rec.get("number") not in seen:
+                seen.add(rec["number"])
+                all_results.append(rec)
+
+    return {"result": all_results, "total": len(all_results), "keywords_used": keywords}
+
+
+# ─── Change Requests ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_change(number: str) -> dict:
+    """
+    Get a single change request by number (e.g. CHG0030001).
+
+    Args:
+        number: Change number (e.g. 'CHG0030001')
+    """
+    data = await _get(_table("change_request"), params={
+        "sysparm_query":         f"number={number}",
+        "sysparm_display_value": "true",
+        "sysparm_limit":         1,
+    })
+    records = (data or {}).get("result", [])
+    return records[0] if records else {"error": f"Change {number} not found"}
+
+
+@mcp.tool()
+async def list_changes(
+    query: str = "active=true",
+    fields: str = "number,short_description,state,type,start_date,end_date,assigned_to,assignment_group",
+    limit: int = 10,
+) -> dict:
+    """
+    List change requests. Common query patterns:
+      - Scheduled this week: start_dateBETWEENjavascript:gs.beginningOfThisWeek()@javascript:gs.endOfThisWeek()
+      - Emergency changes:   type=emergency^active=true
+      - Awaiting approval:   state=-5
+
+    Args:
+        query  : Encoded query string
+        fields : Fields to return
+        limit  : Max records (max 100)
+    """
+    return await _get(_table("change_request"), params={
+        "sysparm_query":         query,
+        "sysparm_fields":        fields,
+        "sysparm_limit":         max(1, min(limit, 100)),
+        "sysparm_display_value": "true",
+    }) or {"error": "Query failed"}
+
+
+@mcp.tool()
+async def create_change(
+    short_description: str,
+    change_type: str = "normal",
+    assignment_group: str = "",
+    description: str = "",
+    justification: str = "",
+    risk: str = "3",
+    impact: str = "3",
+    start_date: str = "",
+    end_date: str = "",
+) -> dict:
+    """
+    Create a new change request.
+
+    Args:
+        short_description : Summary of the change (required)
+        change_type       : 'normal', 'standard', or 'emergency' (default: normal)
+        assignment_group  : Group responsible for the change
+        description       : Detailed description
+        justification     : Business justification
+        risk              : 1=High, 2=Medium, 3=Low, 4=Very Low (default: 3)
+        impact            : 1=High, 2=Medium, 3=Low (default: 3)
+        start_date        : Planned start (format: 2025-01-15 09:00:00)
+        end_date          : Planned end (format: 2025-01-15 17:00:00)
+    """
+    body: dict[str, Any] = {
+        "short_description": short_description,
+        "type":              change_type,
+        "risk":              risk,
+        "impact":            impact,
+    }
+    if assignment_group:  body["assignment_group"] = assignment_group
+    if description:       body["description"]      = description
+    if justification:     body["justification"]    = justification
+    if start_date:        body["start_date"]       = start_date
+    if end_date:          body["end_date"]         = end_date
+    return await _post(_table("change_request"), body) or {"error": "Create failed"}
+
+
+# ─── Problems ─────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_problem(number: str) -> dict:
+    """
+    Get a single problem record by number (e.g. PRB0040001).
+
+    Args:
+        number: Problem number (e.g. 'PRB0040001')
+    """
+    data = await _get(_table("problem"), params={
+        "sysparm_query":         f"number={number}",
+        "sysparm_display_value": "true",
+        "sysparm_limit":         1,
+    })
+    records = (data or {}).get("result", [])
+    return records[0] if records else {"error": f"Problem {number} not found"}
+
+
+@mcp.tool()
+async def list_problems(
+    query: str = "active=true",
+    fields: str = "number,short_description,state,priority,assigned_to,known_error",
+    limit: int = 10,
+) -> dict:
+    """
+    List problem records. Common queries:
+      - Known errors: known_error=true^active=true
+      - High priority: priority=1^ORpriority=2^active=true
+
+    Args:
+        query  : Encoded query string
+        fields : Fields to return
+        limit  : Max records (max 100)
+    """
+    return await _get(_table("problem"), params={
+        "sysparm_query":         query,
+        "sysparm_fields":        fields,
+        "sysparm_limit":         max(1, min(limit, 100)),
+        "sysparm_display_value": "true",
+    }) or {"error": "Query failed"}
+
+
+# ─── CMDB ─────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_ci(name_or_sys_id: str, ci_class: str = "cmdb_ci") -> dict:
+    """
+    Get a Configuration Item (CI) from the CMDB by name or sys_id.
+
+    Args:
+        name_or_sys_id : CI name (e.g. 'PROD-WEB-01') or sys_id
+        ci_class       : CI class table (default: cmdb_ci). Use cmdb_ci_server,
+                         cmdb_ci_app_server, cmdb_ci_database, etc. for specific types.
+    """
+    _validate_table(ci_class)
+    data = await _get(_table(ci_class), params={
+        "sysparm_query":         f"name={name_or_sys_id}",
+        "sysparm_display_value": "true",
+        "sysparm_limit":         1,
+    })
+    records = (data or {}).get("result", [])
+    if records:
+        return records[0]
+
+    # Fall back to sys_id lookup (only if it looks like a valid sys_id)
+    if _SYS_ID_RE.match(name_or_sys_id):
+        data = await _get(f"{_table(ci_class)}/{name_or_sys_id}", params={
+            "sysparm_display_value": "true"
+        })
+        if data and "error" not in data:
+            return data
+
+    return {"error": f"CI '{name_or_sys_id}' not found in {ci_class}"}
+
+
+@mcp.tool()
+async def list_cis(
+    query: str = "install_status=1",
+    ci_class: str = "cmdb_ci",
+    fields: str = "name,sys_class_name,install_status,assigned_to,location,support_group",
+    limit: int = 10,
+) -> dict:
+    """
+    List Configuration Items from the CMDB.
+    Common queries:
+      - All servers:          sys_class_name=cmdb_ci_server^install_status=1
+      - CIs in location:      location.name=Tampa Data Center
+      - Unsupported/EOL:      install_status=7
+
+    Args:
+        query    : Encoded query
+        ci_class : CI table (default: cmdb_ci)
+        fields   : Fields to return
+        limit    : Max records (max 100)
+    """
+    _validate_table(ci_class)
+    return await _get(_table(ci_class), params={
+        "sysparm_query":         query,
+        "sysparm_fields":        fields,
+        "sysparm_limit":         max(1, min(limit, 100)),
+        "sysparm_display_value": "true",
+    }) or {"error": "Query failed"}
+
+
+@mcp.tool()
+async def get_ci_relationships(ci_sys_id: str) -> dict:
+    """
+    Get all relationships (upstream/downstream) for a given CI.
+    Useful for impact analysis — shows what depends on this CI and what it depends on.
+
+    Args:
+        ci_sys_id: sys_id of the CI (32-char hex GUID)
+    """
+    _validate_sys_id(ci_sys_id)
+    data = await _get(_table("cmdb_rel_ci"), params={
+        "sysparm_query":         f"parent={ci_sys_id}^ORchild={ci_sys_id}",
+        "sysparm_fields":        "parent.name,child.name,type.name,parent.sys_class_name,child.sys_class_name",
+        "sysparm_display_value": "true",
+        "sysparm_limit":         50,
+    })
+    return data or {"error": "Could not fetch relationships"}
+
+
+# ─── Users ────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_user(username_or_email: str) -> dict:
+    """
+    Look up a ServiceNow user by username or email address.
+
+    Args:
+        username_or_email: Username (user_name field) or email address
+    """
+    query = f"user_name={username_or_email}^ORemail={username_or_email}"
+    data = await _get(_table("sys_user"), params={
+        "sysparm_query":         query,
+        "sysparm_fields":        "user_name,name,email,department,manager,active,roles",
+        "sysparm_display_value": "true",
+        "sysparm_limit":         1,
+    })
+    records = (data or {}).get("result", [])
+    return records[0] if records else {"error": f"User '{username_or_email}' not found"}
+
+
+@mcp.tool()
+async def list_users(
+    query: str = "active=true",
+    fields: str = "user_name,name,email,department,manager",
+    limit: int = 10,
+) -> dict:
+    """
+    List ServiceNow users.
+
+    Args:
+        query  : Encoded query (e.g. 'department.name=IT^active=true')
+        fields : Fields to return
+        limit  : Max records (max 100)
+    """
+    return await _get(_table("sys_user"), params={
+        "sysparm_query":         query,
+        "sysparm_fields":        fields,
+        "sysparm_limit":         max(1, min(limit, 100)),
+        "sysparm_display_value": "true",
+    }) or {"error": "Query failed"}
+
+
+# ─── Service Catalog ──────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_catalog_items(
+    query: str = "active=true^sc_catalogs!=NULL",
+    limit: int = 10,
+) -> dict:
+    """
+    List available Service Catalog items.
+
+    Args:
+        query : Encoded query to filter catalog items
+        limit : Max records (max 100)
+    """
+    return await _get(_table("sc_cat_item"), params={
+        "sysparm_query":         query,
+        "sysparm_fields":        "name,short_description,category,price,delivery_time",
+        "sysparm_limit":         max(1, min(limit, 100)),
+        "sysparm_display_value": "true",
+    }) or {"error": "Query failed"}
+
+
+@mcp.tool()
+async def submit_catalog_request(
+    catalog_item_sys_id: str,
+    variables: dict,
+    requested_for: str = "",
+) -> dict:
+    """
+    Submit a Service Catalog request for a given catalog item.
+
+    Args:
+        catalog_item_sys_id : sys_id of the catalog item to request (32-char hex GUID)
+        variables           : Dict of variable name -> value for the request form
+        requested_for       : Username to request on behalf of (blank = current user)
+    """
+    _validate_sys_id(catalog_item_sys_id)
+    body: dict[str, Any] = {
+        "sysparm_id":       catalog_item_sys_id,
+        "sysparm_quantity": "1",
+        "variables":        variables,
+    }
+    if requested_for:
+        body["requested_for"] = requested_for
+    return await _post(
+        f"/api/sn_sc/servicecatalog/items/{catalog_item_sys_id}/order_now", body
+    ) or {"error": "Request failed"}
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+
+    if transport == "streamable-http":
+        import uvicorn
+        app = mcp.streamable_http_app()
+        wrapped = _BearerAuth(app)
+        logger.info("ServiceNow MCP server listening on 0.0.0.0:%d", PORT)
+        uvicorn.run(wrapped, host="0.0.0.0", port=PORT)
+    else:
+        mcp.run(transport="stdio")
