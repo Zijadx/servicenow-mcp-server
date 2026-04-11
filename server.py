@@ -311,14 +311,31 @@ async def update_record(table_name: str, sys_id: str, fields: dict) -> dict:
     """
     Update an existing ServiceNow record by sys_id.
 
+    For kb_knowledge records, automatically transitions through draft → update → published
+    to satisfy ServiceNow's workflow ACL on published articles.
+
     Args:
-        table_name : Table name (e.g. 'incident')
+        table_name : Table name (e.g. 'incident', 'kb_knowledge')
         sys_id     : The record's sys_id (32-char hex GUID)
         fields     : Dict of field_name -> new value. Only include fields to change.
                      Example: {"state": "2", "work_notes": "Investigating now"}
     """
     _validate_table(table_name)
     _validate_sys_id(sys_id)
+
+    if table_name == "kb_knowledge":
+        path = f"{_table(table_name)}/{sys_id}"
+        draft = await _patch(path, {"workflow_state": "draft"})
+        if draft and "error" in draft:
+            return {"error": f"Could not set article to draft: {draft['error']}"}
+        result = await _patch(path, fields)
+        if result and "error" in result:
+            return {"error": f"Could not update article: {result['error']}"}
+        published = await _patch(path, {"workflow_state": "published"})
+        if published and "error" in published:
+            return {"error": f"Update applied but could not re-publish: {published['error']}"}
+        return published or {"error": "Update failed"}
+
     return await _patch(f"{_table(table_name)}/{sys_id}", fields) or {"error": "Update failed"}
 
 
