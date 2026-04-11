@@ -1,5 +1,23 @@
 # ServiceNow MCP Server — Release Notes
 
+## v2.1.0 — April 10, 2026
+
+### Overview
+
+v2.1.0 reduces the tool surface to a focused, production-appropriate scope. Ten tools covering Change Requests, Problems, CMDB, and the Service Catalog have been removed. The server now covers Incidents, generic record CRUD (suitable for Knowledge Base access), Users, and admin utilities — 15 tools total.
+
+### What's New in v2.1.0
+
+#### Scope Reduction
+- **Removed:** Change Requests (`get_change`, `list_changes`, `create_change`)
+- **Removed:** Problems (`get_problem`, `list_problems`)
+- **Removed:** CMDB (`get_ci`, `list_cis`, `get_ci_relationships`)
+- **Removed:** Service Catalog (`list_catalog_items`, `submit_catalog_request`)
+
+A smaller tool surface means less attack surface, simpler auditing, and a more predictable model behavior. Knowledge Base articles and categories are accessible via the generic CRUD tools (`get_record`, `list_records`, `create_record`, `update_record`, `delete_record`) against the `kb_knowledge` and `kb_category` tables.
+
+---
+
 ## v2.0.0 — April 10, 2026
 
 ### Overview
@@ -33,18 +51,14 @@ ServiceNow MCP Server v2.0.0 is the first production-ready release of a Model Co
 
 ### Capabilities
 
-26 tools across 8 categories are available in this release:
+15 tools across 4 categories are available in this release:
 
-| Category | Tools |
-|---|---|
-| Incidents | Get, list, create, update, find similar |
-| Change Requests | Get, list, create |
-| Problems | Get, list |
-| CMDB | Get CI, list CIs, get CI relationships |
-| Users | Get, list |
-| Service Catalog | List items, submit request |
-| Generic Records | Get, list, create, update, delete |
-| Utilities | Health check, run query, get table schema |
+| Category | Tools | Notes |
+|---|---|---|
+| Incidents | Get, list, create, update, find similar | Delete via generic `delete_record` |
+| Generic Records | Get, list, create, update, delete | Covers KB articles/categories and any other table |
+| Users | Get, list | |
+| Utilities | Health check, run query, get table schema | |
 
 ---
 

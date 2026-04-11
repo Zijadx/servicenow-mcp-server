@@ -1,6 +1,6 @@
 # ServiceNow MCP Server — Technical Specifications
 
-**Version:** 2.0.0  
+**Version:** 2.1.0  
 **Language:** Python 3.10+  
 **Protocol:** Model Context Protocol (MCP) 2024-11-05  
 **ServiceNow API:** Table API (`/api/now/table/`) + Service Catalog API (`/api/sn_sc/`)
@@ -130,6 +130,11 @@ Validation failures raise `ValueError`, which FastMCP surfaces as a tool error t
 
 ## Tools Reference
 
+> **Scope:** Incidents, generic record CRUD, users, and utilities — 15 tools total.
+> Knowledge Base articles (`kb_knowledge`) and categories (`kb_category`) are accessible
+> via the generic CRUD tools. Change Requests, Problems, CMDB, and Service Catalog are
+> out of scope in this release.
+
 ### Utility
 
 #### `health_check()`
@@ -181,42 +186,6 @@ Tokenizes `input_text`, removes stop words, and runs a `short_descriptionCONTAIN
 
 ---
 
-### Change Requests
-
-#### `get_change(number)`
-Fetches a change request by number (e.g. `CHG0030001`).
-
-#### `list_changes(query, fields, limit)`
-Lists change requests. Default query: `active=true`.
-
-#### `create_change(short_description, change_type, assignment_group, description, justification, risk, impact, start_date, end_date)`
-Creates a change request. `change_type` accepts `normal`, `standard`, or `emergency`.
-
----
-
-### Problems
-
-#### `get_problem(number)`
-Fetches a problem record by number (e.g. `PRB0040001`).
-
-#### `list_problems(query, fields, limit)`
-Lists problems. Default query: `active=true`.
-
----
-
-### CMDB
-
-#### `get_ci(name_or_sys_id, ci_class)`
-Attempts a name lookup first; falls back to sys_id lookup if the input is a valid 32-char hex string. Default table: `cmdb_ci`.
-
-#### `list_cis(query, ci_class, fields, limit)`
-Lists CIs from any CMDB class table. Default query: `install_status=1` (installed).
-
-#### `get_ci_relationships(ci_sys_id)`
-Queries `cmdb_rel_ci` for all relationships where the CI is parent or child. Returns up to 50 relationships with parent/child names, class names, and relationship type.
-
----
-
 ### Users
 
 #### `get_user(username_or_email)`
@@ -224,16 +193,6 @@ Queries `sys_user` with `user_name=X^ORemail=X`. Returns user details including 
 
 #### `list_users(query, fields, limit)`
 Lists users. Default query: `active=true`.
-
----
-
-### Service Catalog
-
-#### `list_catalog_items(query, limit)`
-Queries `sc_cat_item`. Default query: `active=true^sc_catalogs!=NULL`. Returns name, description, category, price, and delivery time.
-
-#### `submit_catalog_request(catalog_item_sys_id, variables, requested_for)`
-POSTs to `/api/sn_sc/servicecatalog/items/{sys_id}/order_now` with a variables dict and optional `requested_for` username.
 
 ---
 
