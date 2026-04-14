@@ -1,5 +1,63 @@
 # ServiceNow MCP Server — Release Notes
 
+## v3.0.0 — April 14, 2026
+
+### Overview
+
+v3.0.0 introduces the **Security Analyst Agent** — an AI-powered security incident investigator built on Claude Opus 4.6 with adaptive thinking. Given a security alert (from CrowdStrike, Sentinel, or any EDR/SIEM), the agent autonomously runs a full Tier-2 SOC investigation across 8 specialized tools, produces a NIST SP 800-61-aligned analysis report, and files a Priority 1 incident in ServiceNow — all in under 2 minutes.
+
+This release also adds `anthropic` to the dependency stack and extends `.env` with Anthropic API key support.
+
+---
+
+### What's New in v3.0.0
+
+#### Security Analyst Agent (`security_analyst.py`)
+
+A single-agent agentic loop powered by Claude Opus 4.6 with adaptive thinking. The agent investigates security alerts end-to-end without human prompting, using a systematic toolkit that mirrors a Tier-2 SOC workflow.
+
+**8 investigation tools:**
+
+| Tool | Data Source | Type |
+|---|---|---|
+| `lookup_cve` | NIST NVD API | Real |
+| `check_ip_reputation` | AbuseIPDB API | Real (simulated fallback if key not set) |
+| `get_mitre_technique` | MITRE ATT&CK v14 | Real (cached) |
+| `get_asset_context` | ServiceNow CMDB | Real |
+| `query_siem_logs` | — | Simulated (replace with Splunk/QRadar/Sentinel) |
+| `get_process_tree` | — | Simulated (replace with CrowdStrike/SentinelOne) |
+| `check_file_hash` | — | Simulated (replace with VirusTotal/ThreatConnect) |
+| `create_security_incident` | ServiceNow incident table | Real |
+
+**Report output (NIST SP 800-61 aligned):**
+- Executive summary for leadership
+- Chronological attack timeline with kill chain phase labels
+- Technical findings: CVE details, attacker infrastructure, process execution chain
+- MITRE ATT&CK mapping with tactic and technique IDs
+- Full IOC table (IPs, hashes, files, URLs, accounts)
+- Prioritized remediation: Immediate / 24-hour / 30-day
+- Confidence assessment per finding dimension
+- Data source provenance (real vs. simulated clearly labeled)
+
+**Three run modes:**
+```bash
+python3 security_analyst.py                        # built-in Log4Shell demo alert
+python3 security_analyst.py --alert alert.json     # load custom alert JSON
+python3 security_analyst.py --incident INC0010340  # investigate existing SN incident
+```
+
+**Tested against:** Log4Shell (CVE-2021-44228) demo alert. Agent completed in 6 iterations, filed INC0010344 as Priority 1 - Critical with full report in work notes.
+
+#### Dependency update
+- Added `anthropic>=0.50.0,<1.0.0` to `requirements.txt`
+
+#### Environment update
+- Added `ANTHROPIC_API_KEY` to `.env.example` (required for Security Analyst Agent)
+- Added `ABUSEIPDB_API_KEY` to `.env.example` (optional — enables real IP reputation data)
+- `load_dotenv(override=True)` ensures `.env` values take precedence over shell environment
+
+---
+
 ## v2.1.0 — April 10, 2026
 
 ### Overview
