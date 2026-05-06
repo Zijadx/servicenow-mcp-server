@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in — Automatiki</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="auth-body">
+  <main class="auth-shell">
+    <div class="auth-card">
+      <div class="brand">
+        <span class="brand-mark">A</span>
+        <span class="brand-name">Automatiki</span>
+      </div>
+      <h1 class="auth-title">Sign in to ServiceNow</h1>
+      <p class="auth-sub">Use your ServiceNow username and password to access the connector.</p>
+
+      <form id="loginForm" class="auth-form" novalidate>
+        <label class="field">
+          <span class="field-label">ServiceNow Username</span>
+          <input id="username" name="username" type="text" autocomplete="username" required />
+        </label>
+        <label class="field">
+          <span class="field-label">ServiceNow Password</span>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="btn-primary" id="submitBtn">
+          <span class="btn-label">Connect</span>
+          <span class="btn-spinner" aria-hidden="true"></span>
+        </button>
+        <p id="errorMsg" class="error" role="alert" hidden></p>
+      </form>
+
+      <p class="auth-fineprint">
+        Your credentials are used only to verify access and are not stored.
+      </p>
+    </div>
+  </main>
+  <script src="/static/login.js"></script>
+</body>
+</html>
