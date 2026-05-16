@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  mcp-server:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_PORT: 8000
+      SN_INSTANCE: ${SN_INSTANCE}
+      SN_USER: ${SN_USER}
+      SN_PASS: ${SN_PASS}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/mcp', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
