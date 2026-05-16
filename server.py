@@ -550,6 +550,233 @@ async def get_similar_incidents(
     return {"result": all_results, "total": len(all_results), "keywords_used": keywords}
 
 
+# ─── Discovery: Incidents ─────────────────────────────────────────────────────
+# Paste this block into server.py before the # ─── Users ─── section
+
+@mcp.tool()
+async def discover_incidents(
+days_back: int = 90,
+limit: int = 1000,
+) -> dict:
+    """
+    Recon tool — queries the incident table to surface automation opportunities.
+
+    Analyzes incident patterns over a rolling window and returns ranked insights:
+    - Volume by category and subcategory
+    - Mean time to resolve (MTTR) per category
+    - Repeat/recurring incident patterns
+    - High-volume + low-complexity candidates for automation or Virtual Agent deflection
+    - Resolution code distribution (how-to, self-service, known error, etc.)
+
+    Args:
+        days_back : Rolling lookback window in days (default 90)
+        limit     : Max incidents to analyze (default 1000, max 2000)
+    """
+    import json
+    from collections import defaultdict
+    from datetime import datetime, timedelta, timezone
+
+    capped_limit = max(1, min(limit, 2000))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    # ── 1. Pull incidents ──────────────────────────────────────────────────────
+    data = await _get(
+        _table("incident"),
+        params={
+            "sysparm_query": f"sys_created_on>={cutoff}^state!=6",  # exclude cancelled
+            "sysparm_fields": (
+                "number,category,subcategory,priority,state,"
+                "assignment_group,close_code,short_description,"
+                "sys_created_on,resolved_at,closed_at,caller_id"
+            ),
+            "sysparm_limit": capped_limit,
+            "sysparm_display_value": "true",
+        },
+    )
+
+    records = (data or {}).get("result", [])
+    if not records:
+        return {"error": "No incidents found for the given window.", "days_back": days_back}
+
+    total = len(records)
+
+    # ── 2. Aggregate ───────────────────────────────────────────────────────────
+    cat_volume: dict[str, int] = defaultdict(int)
+    subcat_volume: dict[str, int] = defaultdict(int)
+    cat_mttr_minutes: dict[str, list[float]] = defaultdict(list)
+    close_code_volume: dict[str, int] = defaultdict(int)
+    group_volume: dict[str, int] = defaultdict(int)
+    priority_volume: dict[str, int] = defaultdict(int)
+    desc_map: dict[str, int] = defaultdict(int)          # short_desc dedup → recurrence
+    caller_map: dict[str, int] = defaultdict(int)        # repeat callers
+
+    for inc in records:
+        cat   = inc.get("category") or "uncategorized"
+        subcat = inc.get("subcategory") or "none"
+        group  = inc.get("assignment_group") or "unassigned"
+        prio   = inc.get("priority") or "unknown"
+        code   = inc.get("close_code") or "not closed"
+        desc   = (inc.get("short_description") or "").strip().lower()[:80]
+        caller = inc.get("caller_id") or "unknown"
+
+        cat_volume[cat] += 1
+        subcat_volume[f"{cat} / {subcat}"] += 1
+        group_volume[group] += 1
+        priority_volume[prio] += 1
+        close_code_volume[code] += 1
+        if desc:
+            desc_map[desc] += 1
+        caller_map[caller] += 1
+
+        # MTTR — use resolved_at, fallback to closed_at
+        created_raw   = inc.get("sys_created_on", "")
+        resolved_raw  = inc.get("resolved_at") or inc.get("closed_at", "")
+        if created_raw and resolved_raw:
+            try:
+                fmt = "%Y-%m-%d %H:%M:%S"
+                created_dt  = datetime.strptime(created_raw, fmt)
+                resolved_dt = datetime.strptime(resolved_raw, fmt)
+                minutes = (resolved_dt - created_dt).total_seconds() / 60
+                if minutes > 0:
+                    cat_mttr_minutes[cat].append(minutes)
+            except Exception:
+                pass
+
+    # ── 3. Build ranked category table ────────────────────────────────────────
+    def avg(lst: list[float]) -> float:
+        return round(sum(lst) / len(lst), 1) if lst else 0.0
+
+    ranked_categories = sorted(
+        [
+            {
+                "category": cat,
+                "incident_count": vol,
+                "pct_of_total": round(vol / total * 100, 1),
+                "avg_mttr_minutes": avg(cat_mttr_minutes.get(cat, [])),
+                "mttr_sample_size": len(cat_mttr_minutes.get(cat, [])),
+            }
+            for cat, vol in cat_volume.items()
+        ],
+        key=lambda x: x["incident_count"],
+        reverse=True,
+    )
+
+    ranked_subcats = sorted(
+        [{"subcategory": k, "count": v} for k, v in subcat_volume.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:15]
+
+    # ── 4. Automation candidates ───────────────────────────────────────────────
+    # High volume + low MTTR = strong automation signal
+    # Close codes associated with self-service / how-to = deflection signal
+    deflection_codes = {
+        "solved (permanently)", "solved (work around)", "solved remotely",
+        "not solved (not reproducible)", "closed/resolved by caller",
+        "how to", "self-service", "known error",
+    }
+
+    deflection_volume = sum(
+        v for code, v in close_code_volume.items()
+        if any(d in code.lower() for d in deflection_codes)
+    )
+
+    automation_candidates = []
+    for cat_data in ranked_categories:
+        cat  = cat_data["category"]
+        vol  = cat_data["incident_count"]
+        mttr = cat_data["avg_mttr_minutes"]
+        pct  = cat_data["pct_of_total"]
+        score = 0
+        reasons = []
+
+        if vol >= total * 0.08:       # 8%+ of all incidents
+            score += 3
+            reasons.append(f"high volume ({pct}% of total)")
+        elif vol >= total * 0.04:
+            score += 1
+            reasons.append(f"moderate volume ({pct}% of total)")
+
+        if 0 < mttr <= 30:
+            score += 3
+            reasons.append(f"fast resolution (avg {mttr} min)")
+        elif 0 < mttr <= 90:
+            score += 1
+            reasons.append(f"moderate resolution time (avg {mttr} min)")
+
+        if score >= 3:
+            priority = "🔥 High"
+        elif score == 2:
+            priority = "⚡ Medium"
+        elif score >= 1:
+            priority = "👀 Low"
+        else:
+            continue
+
+        automation_candidates.append({
+            "category": cat,
+            "automation_priority": priority,
+            "incident_count": vol,
+            "avg_mttr_minutes": mttr,
+            "reasons": reasons,
+            "suggested_approach": (
+                "Virtual Agent deflection + Flow Designer auto-resolve"
+                if score >= 4
+                else "Virtual Agent deflection"
+                if score >= 2
+                else "Knowledge article + self-service catalog"
+            ),
+        })
+
+    # ── 5. Recurring descriptions (repeat incident signal) ────────────────────
+    recurring = sorted(
+        [{"description": d, "occurrences": c} for d, c in desc_map.items() if c >= 3],
+        key=lambda x: x["occurrences"],
+        reverse=True,
+    )[:10]
+
+    # ── 6. Top repeat callers ─────────────────────────────────────────────────
+    top_callers = sorted(
+        [{"caller": c, "incidents": v} for c, v in caller_map.items() if v >= 3],
+        key=lambda x: x["incidents"],
+        reverse=True,
+    )[:10]
+
+    # ── 7. Summary ────────────────────────────────────────────────────────────
+    summary = {
+        "window_days": days_back,
+        "total_incidents_analyzed": total,
+        "unique_categories": len(cat_volume),
+        "deflection_eligible_incidents": deflection_volume,
+        "deflection_eligible_pct": round(deflection_volume / total * 100, 1) if total else 0,
+        "top_category": ranked_categories[0]["category"] if ranked_categories else "n/a",
+        "top_category_volume": ranked_categories[0]["incident_count"] if ranked_categories else 0,
+    }
+
+    return {
+        "summary": summary,
+        "automation_candidates": automation_candidates,
+        "categories_ranked_by_volume": ranked_categories,
+        "subcategories_ranked_by_volume": ranked_subcats,
+        "close_code_distribution": dict(
+            sorted(close_code_volume.items(), key=lambda x: x[1], reverse=True)
+        ),
+        "priority_distribution": dict(
+            sorted(priority_volume.items(), key=lambda x: x[1], reverse=True)
+        ),
+        "assignment_group_volume": dict(
+            sorted(group_volume.items(), key=lambda x: x[1], reverse=True)[:15]
+        ),
+        "recurring_descriptions": recurring,
+        "top_repeat_callers": top_callers,
+    }
+
+
+
+
+
 # ─── Users ────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
