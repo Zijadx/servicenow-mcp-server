@@ -90,10 +90,16 @@ mcp = FastMCP("servicenow", lifespan=lifespan)
 
 # ─── Health check endpoint (unauthenticated) ──────────────────────────────────
 from starlette.routing import Route
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
 async def health(request):
     return JSONResponse({"status": "ok"})
+
+async def root(request):
+    return PlainTextResponse("ServiceNow MCP server. POST /mcp for MCP traffic.")
+
+# Paths exempted from Bearer auth (probes, health checks, root landing)
+_AUTH_EXEMPT_PATHS = {"/health", "/healthz", "/"}
 
 # ─── ASGI Bearer-token auth middleware ────────────────────────────────────────
 
@@ -104,7 +110,11 @@ class _BearerAuth:
         self._app = app
 
     async def __call__(self, scope, receive, send):
-        if MCP_AUTH_TOKEN and scope["type"] in ("http", "websocket"):
+        if (
+            MCP_AUTH_TOKEN
+            and scope["type"] in ("http", "websocket")
+            and scope.get("path") not in _AUTH_EXEMPT_PATHS
+        ):
             headers = {k.lower(): v for k, v in scope.get("headers", [])}
             auth_header = headers.get(b"authorization", b"").decode()
             if auth_header != f"Bearer {MCP_AUTH_TOKEN}":
@@ -835,6 +845,11 @@ if __name__ == "__main__":
     if transport == "streamable-http":
         import uvicorn
         app = mcp.streamable_http_app()
+        # Add unauthenticated health + root routes so probes (Railway, Claude
+        # Desktop reachability checks, uptime monitors) don't get 404/401.
+        app.router.routes.append(Route("/health", health, methods=["GET"]))
+        app.router.routes.append(Route("/healthz", health, methods=["GET"]))
+        app.router.routes.append(Route("/", root, methods=["GET"]))
         wrapped = _BearerAuth(app)
         logger.info("ServiceNow MCP server listening on 0.0.0.0:%d", PORT)
         uvicorn.run(wrapped, host="0.0.0.0", port=PORT)
