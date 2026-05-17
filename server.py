@@ -88,6 +88,13 @@ async def lifespan(app):
 
 mcp = FastMCP("servicenow", lifespan=lifespan)
 
+# ─── Health check endpoint (unauthenticated) ──────────────────────────────────
+from starlette.routing import Route
+from starlette.responses import JSONResponse
+
+async def health(request):
+    return JSONResponse({"status": "ok"})
+
 # ─── ASGI Bearer-token auth middleware ────────────────────────────────────────
 
 class _BearerAuth:
