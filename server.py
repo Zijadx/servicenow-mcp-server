@@ -42,7 +42,7 @@ SN_BASE        = _require_env("SN_INSTANCE")
 SN_USER        = _require_env("SN_USER")
 SN_PASS        = _require_env("SN_PASS")
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")  # Required in production — set this
-PORT           = int(os.environ.get("MCP_PORT", "8000"))
+PORT = int(os.environ.get("PORT", os.environ.get("MCP_PORT", "8000")))
 
 if not MCP_AUTH_TOKEN:
     logger.warning("MCP_AUTH_TOKEN is not set — server is unauthenticated. Set this in production.")
