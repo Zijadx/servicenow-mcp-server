@@ -834,18 +834,7 @@ if __name__ == "__main__":
 
     if transport == "streamable-http":
         import uvicorn
-        from starlette.applications import Starlette
-        from starlette.routing import Route, Mount
-        from starlette.responses import JSONResponse
-
-        async def health(request):
-            return JSONResponse({"status": "ok"})
-
-        mcp_app = mcp.streamable_http_app()
-        app = Starlette(routes=[
-            Route("/health", health),
-            Mount("/", app=mcp_app),
-        ])
+        app = mcp.streamable_http_app()
         wrapped = _BearerAuth(app)
         logger.info("ServiceNow MCP server listening on 0.0.0.0:%d", PORT)
         uvicorn.run(wrapped, host="0.0.0.0", port=PORT)
