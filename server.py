@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 load_dotenv()
 
@@ -86,7 +87,18 @@ async def lifespan(app):
 
 # ─── Server init ─────────────────────────────────────────────────────────────
 
-mcp = FastMCP("servicenow", lifespan=lifespan)
+# DNS-rebinding protection in FastMCP defaults to allowing only localhost. When
+# deployed behind a proxy (Railway, etc.) the Host header is the public domain
+# and gets rejected with HTTP 421 "Invalid Host header". Honor an optional
+# MCP_ALLOWED_HOSTS env var ("host1,host2") and otherwise disable the check.
+_allowed_hosts = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+_transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=bool(_allowed_hosts),
+    allowed_hosts=_allowed_hosts or ["*"],
+    allowed_origins=["*"],
+)
+
+mcp = FastMCP("servicenow", lifespan=lifespan, transport_security=_transport_security)
 
 # ─── Health check endpoint (unauthenticated) ──────────────────────────────────
 from starlette.routing import Route
